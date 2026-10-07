@@ -11,6 +11,29 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import easyocr
+
+reader = easyocr.Reader(['en'], gpu =True)
+
+def parse_file(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    
+    # 1. Handling File Gambar (.png, .jpg)
+    if ext in ['.png', '.jpg', '.jpeg']:
+        try:
+            results = reader.readtext(file_path, detail=0)
+            return " ".join(results)  # Mengembalikan teks hasil OCR dari gambar
+        except Exception as e:
+            print(f"[Warning] Gagal OCR gambar {file_path}: {e}")
+            return ""
+            
+    # 2. Handling File Teks Biasa (.txt, .log, .py)
+    elif ext in ['.txt', '.log', '.py']:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()
+            
+    # ... (tambahkan parser pdf/docx/excel jika ada)
+    return ""
 
 SOCKET_PATH = "/tmp/rag_daemon.sock"
 TCP_HOST = "127.0.0.1"
