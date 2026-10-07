@@ -10,15 +10,14 @@ PyMuPDF>=1.24.0
 python-docx>=1.1.0
 openpyxl>=3.1.0
 
-# OCR and image handling
-easyocr>=1.7.0
+# Vision-Language Model (vLLM for Llama Vision)
+vllm>=0.3.0
 Pillow>=10.0.0
-opencv-python-headless>=4.9.0
 
 # Embeddings and LLM infrastructure
-transformers>=4.42.0
 sentence-transformers>=3.0.0
 huggingface-hub>=0.23.0
 
 # Utilities
 tqdm>=4.9.0
+

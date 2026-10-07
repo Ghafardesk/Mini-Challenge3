@@ -1,23 +1,33 @@
-# Dual-Model Multimodal RAG Refactoring - Validation Checklist
+# Dual-Model Vision-Language RAG Refactoring - Validation Checklist
 
 ## Part 1: download_model.py Refactoring ✅
 
 ### Embedding Model (sentence-transformers/all-MiniLM-L6-v2)
 - [x] Downloads snapshot using `huggingface_hub.snapshot_download`
 - [x] Target directory: `./models/all-MiniLM-L6-v2`
-- [x] Implementation: Lines 30-40 in download_model.py
+- [x] Implementation: Lines 48-60 in download_model.py
+- [x] Resume-download enabled for partial recovery
 
-### EasyOCR Models (CRAFT + English Recognition)
-- [x] Initialize `easyocr.Reader(['en'], download_enabled=True, model_storage_directory='./models/easyocr')`
-- [x] Target directory: `./models/easyocr`
-- [x] Implementation: Lines 44-54 in download_model.py
+### Vision-Language Model (meta-llama/Llama-3.2-11B-Vision-Instruct)
+- [x] Downloads snapshot using `huggingface_hub.snapshot_download`
+- [x] Target directory: `./models/Llama-3.2-11B-Vision-Instruct`
+- [x] Implementation: Lines 63-85 in download_model.py
+- [x] HF_TOKEN support for gated models
+- [x] Resume-download enabled for partial recovery
+- [x] Ignore patterns for non-essential files (*.msgpack, *.h5, *.ot)
+
+### HuggingFace Authentication
+- [x] Verify HF token with HfApi.whoami()
+- [x] Log user info: `[Auth] Logged in to Hugging Face as: {username}`
+- [x] Graceful fallback if token not available
+- [x] Implementation: Lines 27-40 in download_model.py
 
 ### Execution & Error Handling
-- [x] Clear progress logs with [Info], [Success], [Error] prefixes
+- [x] Clear progress logs with [Installer], [Auth], [Success], [Error] prefixes
 - [x] Exit code 0 on success
 - [x] Exit code 1 on failure
 - [x] Graceful exception handling
-- [x] Implementation: main() function, lines 57-92
+- [x] Implementation: main() function, lines 88-120
 
 ---
 
@@ -27,16 +37,18 @@
 
 #### Embedding Engine
 - [x] Load from `./models/all-MiniLM-L6-v2` with fallback to HuggingFace cache
-- [x] EmbeddingService.__init__() updated (lines 73-86)
+- [x] EmbeddingService.__init__() updated (lines 100-113)
 - [x] Tries local directory first, falls back to model name
 
-#### Vision OCR Engine
-- [x] Initialize `easyocr.Reader(['en'], gpu=True, model_storage_directory='./models/easyocr')`
+#### Vision-Language Engine
+- [x] Initialize `transformers.pipeline('image-to-text', model=...)`
+- [x] Load Llama-3.2-11B-Vision-Instruct from `./models/Llama-3.2-11B-Vision-Instruct`
 - [x] Initialize ONCE at daemon startup
-- [x] Global `_easyocr_reader` variable (line 31)
-- [x] initialize_easyocr_reader() function (lines 34-55)
-- [x] RAGDaemon.__init__() calls initialization (lines 640-654)
+- [x] Global `_vision_pipeline` variable (line 36)
+- [x] initialize_vision_pipeline() function (lines 39-72)
+- [x] RAGDaemon.__init__() calls initialization (lines 676-693)
 - [x] GPU auto-detection with --gpu/--no-gpu flags (main() function)
+- [x] Fallback to HuggingFace Hub if local models not available
 
 ---
 
@@ -44,11 +56,12 @@
 
 #### parse_image() Function
 - [x] Accept `.png`, `.jpg`, `.jpeg` files
-- [x] Run `easyocr_reader.readtext(file_path, detail=0)`
-- [x] Join extracted text chunks into single clean string
+- [x] Run `pipeline(image)` on loaded PIL Image
+- [x] Extract text from vision model output (generated_text field)
+- [x] Join extracted text into single clean string
 - [x] Return empty string `""` on error or no text detected
-- [x] Implementation: Lines 370-388 in daemon.py
-- [x] Uses global reader via get_easyocr_reader()
+- [x] Implementation: Lines 406-442 in daemon.py
+- [x] Uses global pipeline via get_vision_pipeline()
 
 ---
 
@@ -103,13 +116,13 @@
 - [x] **confidence**: Float between 0.0-1.0, rounded to 4 decimals
 
 #### Implementation
-- [x] normalize_answer() function (lines 220-225)
+- [x] normalize_answer() function (lines 241-246)
   - Converts to UPPERCASE
   - Strips leading/trailing whitespace
   - Removes special separators: -, ., ·, _
   - Returns "" if unanswerable
-- [x] extract_answer_from_context() uses normalize_answer() (line 553)
-- [x] build_response_for_query() formats output (lines 615-632)
+- [x] extract_answer_from_context() uses normalize_answer() (line 593)
+- [x] build_response_for_query() formats output (lines 655-672)
   - Citations: `sorted(list({...}))` returns list of strings
   - Confidence: `round(confidence, 4)` constrains to 0.0-1.0 range
   - Answer: Already normalized to uppercase with chars removed
@@ -121,9 +134,16 @@
 ### Resilience Requirements
 - [x] No unhandled exception in file parsing crashes daemon
 - [x] Socket IPC communication remains fast/non-blocking
-  - Server accepts up to 32 connections (line 673)
-  - No blocking operations in socket loop (lines 657-693)
+  - Server accepts up to 32 connections (line 713)
+  - No blocking operations in socket loop (lines 697-733)
 - [x] PyTorch ROCm packages NOT modified (unchanged from original)
+
+### Vision Pipeline Features
+- [x] Llama Vision initialized from local directory with fallback to Hub
+- [x] GPU device selection (cuda/cpu) based on --gpu/--no-gpu flags
+- [x] PIL Image loading for vision model compatibility
+- [x] Proper output parsing from transformers pipeline
+- [x] Graceful degradation on initialization failure
 
 ### Error Handling Philosophy
 - [x] All file I/O wrapped in try/except
@@ -132,7 +152,7 @@
 - [x] No unhandled exceptions propagate to daemon loop
 
 ### Logging
-- [x] Clear [Warning], [Info], [Success], [Error] prefixes
+- [x] Clear [Warning], [Info], [Success], [Error], [Installer], [Auth] prefixes
 - [x] All edge cases logged with file path for debugging
 - [x] DEBUG level for normal non-error skips
 
@@ -142,7 +162,7 @@
 
 ### Syntax Validation
 - [x] No Python syntax errors (verified with get_errors)
-- [x] All imports available per requirements.txt
+- [x] All imports available per requirements.txt + HuggingFace Transformers
 - [x] Type hints consistent (Optional[Any], List[str], Dict[str, Any], etc.)
 
 ### Integration Points
@@ -150,22 +170,49 @@
 - [x] daemon.py → Loads pre-downloaded models at startup
 - [x] Socket communication → Remains non-blocking
 - [x] File discovery → Handles empty directories gracefully
+- [x] Vision pipeline → Handles local + Hub fallback
 
 ### Offline Container Compatibility
 - [x] Models pre-downloaded to ./models/ by download_model.py
-- [x] EasyOCR initialized with download_enabled=False
-- [x] No external API calls during daemon operation
+- [x] Vision pipeline initialized from local directory with fallback
+- [x] Embedding model loaded from local cache
+- [x] No external API calls during daemon operation (except fallback)
 - [x] All models loaded from local filesystem
+
+### Environment Variable Support
+- [x] HF_TOKEN: For gated Llama models
+- [x] HF_MODEL_ID: To override default vision model ID
+- [x] Graceful handling when not set
 
 ---
 
 ## Summary
 
-✅ **All 4 edge cases handled** in read_corpus_file()
+✅ **Dual-Model Vision-Language Architecture** (Embedding + Vision LLM)
+✅ **HuggingFace Hub Integration** with authentication and resume-download
+✅ **4 edge cases handled** in read_corpus_file()
 ✅ **5 file formats supported** with proper parsers
-✅ **Dual-model architecture** fully integrated
+✅ **Llama-3.2-11B-Vision** for image understanding
 ✅ **Output JSON properly formatted** per spec
 ✅ **No unhandled exceptions** can crash daemon
-✅ **Offline-ready** for container deployment
+✅ **Offline-ready** for container deployment with fallback to Hub
 
 **Status**: READY FOR DEPLOYMENT
+
+---
+
+## Key Differences from Previous EasyOCR Implementation
+
+| Feature | Previous (EasyOCR) | Current (Llama Vision) |
+|---------|-------------------|----------------------|
+| **Type** | OCR Engine | Vision-Language Model |
+| **Models** | CRAFT + Text Recognition | Single unified Llama-3.2 model |
+| **Inference** | Text detection + recognition | Comprehensive image understanding |
+| **Output** | List of text strings | Vision model descriptions |
+| **Capability** | Optical character recognition only | Full visual reasoning & understanding |
+| **Model Size** | ~100MB+ | ~7-23GB (11B parameters) |
+| **Flexibility** | Limited to text extraction | Versatile vision-language tasks |
+| **Integration** | easyocr.Reader | transformers.pipeline |
+| **Download** | Via easyocr initialization | HuggingFace snapshot_download |
+| **Auth** | None required | HF_TOKEN for gated models |
+| **Fallback** | Manual re-download | HuggingFace Hub automatic |

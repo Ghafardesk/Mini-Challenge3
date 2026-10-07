@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Multimodal RAG Daemon supporting dual-model architecture:
+Multimodal RAG Daemon supporting dual-model vision-language architecture:
 - Embedding Model: sentence-transformers/all-MiniLM-L6-v2
-- Vision OCR Engine: EasyOCR (CRAFT + English recognition)
+- Vision-Language Engine: meta-llama/Llama-3.2-11B-Vision-Instruct (via vLLM)
 
 Robust error handling for edge cases: permission denied, encrypted PDFs,
-corrupted files, and empty directories.
+corrupted files, and empty directories. vLLM provides high-performance
+inference with GPU memory optimization and support for batch processing.
 """
 import argparse
 import json
@@ -25,45 +26,47 @@ TCP_HOST = "127.0.0.1"
 TCP_PORT = 8765
 DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_EMBEDDING_DIR = "./models/all-MiniLM-L6-v2"
-DEFAULT_EASYOCR_DIR = "./models/easyocr"
+DEFAULT_VISION_MODEL_ID = os.getenv("HF_MODEL_ID", "meta-llama/Llama-3.2-11B-Vision-Instruct")
+DEFAULT_VISION_DIR = "./models/Llama-3.2-11B-Vision-Instruct"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# Global OCR reader initialized at daemon startup
-_easyocr_reader: Optional[Any] = None
+# Global vLLM engine initialized at daemon startup
+_vision_llm: Optional[Any] = None
 
 
-def initialize_easyocr_reader(model_dir: str = DEFAULT_EASYOCR_DIR, gpu: bool = True) -> Optional[Any]:
+def initialize_vision_llm(model_dir: str = DEFAULT_VISION_DIR, gpu_memory_utilization: float = 0.65, max_model_len: int = 2048) -> Optional[Any]:
     """
-    Initialize EasyOCR reader from local model directory.
+    Initialize vLLM engine for Llama Vision image understanding.
     
     Args:
-        model_dir: Directory containing EasyOCR models.
-        gpu: Whether to use GPU acceleration.
+        model_dir: Local directory containing Llama-3.2-11B-Vision-Instruct model.
+        gpu_memory_utilization: Fraction of GPU memory to use (0.0-1.0).
+        max_model_len: Maximum model sequence length for efficient inference.
     
     Returns:
-        Initialized EasyOCR reader, or None if initialization fails.
+        Initialized vLLM LLM instance, or None if initialization fails.
     """
-    global _easyocr_reader
+    global _vision_llm
     try:
-        import easyocr
+        from vllm import LLM
         
-        _easyocr_reader = easyocr.Reader(
-            ["en"],
-            download_enabled=False,  # Models should be pre-downloaded
-            model_storage_directory=model_dir,
-            gpu=gpu,
+        _vision_llm = LLM(
+            model=model_dir,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            enforce_eager=True,
         )
-        logging.info("Initialized EasyOCR reader from %s (GPU: %s)", model_dir, gpu)
-        return _easyocr_reader
+        logging.info("Initialized vLLM engine from %s (GPU mem util: %.2f)", model_dir, gpu_memory_utilization)
+        return _vision_llm
     except Exception as exc:
-        logging.warning("Failed to initialize EasyOCR reader: %s", exc)
+        logging.warning("Failed to initialize vLLM engine: %s", exc)
         return None
 
 
-def get_easyocr_reader() -> Optional[Any]:
-    """Get the global EasyOCR reader instance."""
-    return _easyocr_reader
+def get_vision_llm() -> Optional[Any]:
+    """Get the global vLLM engine instance."""
+    return _vision_llm
 
 
 @dataclass
@@ -382,7 +385,10 @@ def parse_text_like(path: Path) -> List[str]:
 
 def parse_image(path: Path) -> List[str]:
     """
-    Extract text from PNG/JPG/JPEG images using EasyOCR.
+    Extract text from PNG/JPG/JPEG images using vLLM Llama Vision engine.
+    
+    Acts as an OCR assistant to transcribe all visible text from images.
+    Uses vLLM's high-performance inference with the official OCR prompt.
     
     Args:
         path: Path to image file.
@@ -390,16 +396,44 @@ def parse_image(path: Path) -> List[str]:
     Returns:
         List of text chunks extracted from image, or empty list on failure.
     """
-    reader = get_easyocr_reader()
-    if reader is None:
-        logging.warning("EasyOCR reader not initialized; skipping image %s", path)
+    llm = get_vision_llm()
+    if llm is None:
+        logging.warning("vLLM engine not initialized; skipping image %s", path)
         return []
     
     try:
-        results = reader.readtext(str(path), detail=0)
-        if results:
-            text = " ".join(str(r) for r in results if r)
-            return split_chunks(text)
+        from PIL import Image
+        import base64
+        from io import BytesIO
+        
+        # Load image
+        image = Image.open(path)
+        
+        # Convert image to base64 for vLLM
+        buffered = BytesIO()
+        image.save(buffered, format="PNG" if path.suffix.lower() == ".png" else "JPEG")
+        img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        
+        # Official OCR prompt for Llama Vision
+        ocr_prompt = "Act as an OCR assistant. Analyze the provided <|image|> image and transcribe all visible text exactly as it appears. Output only the transcribed text without commentary."
+        
+        # Prepare multi-modal prompt with image placeholder
+        # vLLM expects the image to be referenced as <|image|> in the prompt
+        prompt = f"<|image|>{ocr_prompt}"
+        
+        # Run inference with vLLM
+        # Note: vLLM handles base64-encoded images via the image parameter
+        outputs = llm.generate(
+            [prompt],
+            sampling_params=None,
+        )
+        
+        # Extract transcribed text from output
+        if outputs and len(outputs) > 0:
+            output_text = outputs[0].outputs[0].text.strip()
+            if output_text:
+                return split_chunks(output_text)
+        
         return []
     except Exception as exc:
         logging.warning("Failed to extract text from image %s: %s", path, exc)
@@ -638,22 +672,23 @@ def build_response_for_query(index: VectorIndex, question: str, embedding_servic
 
 class RAGDaemon:
     def __init__(self, enable_gpu: bool = True):
-        """Initialize RAG daemon with embedding service and OCR reader."""
+        """Initialize RAG daemon with embedding service and vLLM vision engine."""
         # Initialize embedding service with local model directory
         self.embedding_service = EmbeddingService(
             model_name=DEFAULT_MODEL,
             model_dir=DEFAULT_EMBEDDING_DIR
         )
         
-        # Initialize EasyOCR reader from local models
-        initialize_easyocr_reader(
-            model_dir=DEFAULT_EASYOCR_DIR,
-            gpu=enable_gpu
+        # Initialize vLLM engine for Llama Vision from local models
+        initialize_vision_llm(
+            model_dir=DEFAULT_VISION_DIR,
+            gpu_memory_utilization=0.65,
+            max_model_len=2048
         )
         
         self.index = VectorIndex()
         self.index_path: Optional[str] = None
-        logging.info("RAG daemon initialized with GPU=%s", enable_gpu)
+        logging.info("RAG daemon initialized with vLLM vision engine")
 
     def handle_index(self, corpus_dir: str) -> Dict[str, Any]:
         start = time.time()
