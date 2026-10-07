@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""
+Multimodal RAG Daemon supporting dual-model architecture:
+- Embedding Model: sentence-transformers/all-MiniLM-L6-v2
+- Vision OCR Engine: EasyOCR (CRAFT + English recognition)
+
+Robust error handling for edge cases: permission denied, encrypted PDFs,
+corrupted files, and empty directories.
+"""
 import argparse
 import json
 import logging
@@ -10,37 +18,52 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-import easyocr
-
-reader = easyocr.Reader(['en'], gpu =True)
-
-def parse_file(file_path):
-    ext = os.path.splitext(file_path)[1].lower()
-    
-    # 1. Handling File Gambar (.png, .jpg)
-    if ext in ['.png', '.jpg', '.jpeg']:
-        try:
-            results = reader.readtext(file_path, detail=0)
-            return " ".join(results)  # Mengembalikan teks hasil OCR dari gambar
-        except Exception as e:
-            print(f"[Warning] Gagal OCR gambar {file_path}: {e}")
-            return ""
-            
-    # 2. Handling File Teks Biasa (.txt, .log, .py)
-    elif ext in ['.txt', '.log', '.py']:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            return f.read()
-            
-    # ... (tambahkan parser pdf/docx/excel jika ada)
-    return ""
+from typing import Any, Dict, List, Optional, Tuple
 
 SOCKET_PATH = "/tmp/rag_daemon.sock"
 TCP_HOST = "127.0.0.1"
 TCP_PORT = 8765
 DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_EMBEDDING_DIR = "./models/all-MiniLM-L6-v2"
+DEFAULT_EASYOCR_DIR = "./models/easyocr"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# Global OCR reader initialized at daemon startup
+_easyocr_reader: Optional[Any] = None
+
+
+def initialize_easyocr_reader(model_dir: str = DEFAULT_EASYOCR_DIR, gpu: bool = True) -> Optional[Any]:
+    """
+    Initialize EasyOCR reader from local model directory.
+    
+    Args:
+        model_dir: Directory containing EasyOCR models.
+        gpu: Whether to use GPU acceleration.
+    
+    Returns:
+        Initialized EasyOCR reader, or None if initialization fails.
+    """
+    global _easyocr_reader
+    try:
+        import easyocr
+        
+        _easyocr_reader = easyocr.Reader(
+            ["en"],
+            download_enabled=False,  # Models should be pre-downloaded
+            model_storage_directory=model_dir,
+            gpu=gpu,
+        )
+        logging.info("Initialized EasyOCR reader from %s (GPU: %s)", model_dir, gpu)
+        return _easyocr_reader
+    except Exception as exc:
+        logging.warning("Failed to initialize EasyOCR reader: %s", exc)
+        return None
+
+
+def get_easyocr_reader() -> Optional[Any]:
+    """Get the global EasyOCR reader instance."""
+    return _easyocr_reader
 
 
 @dataclass
@@ -52,15 +75,21 @@ class DocumentChunk:
 
 
 class EmbeddingService:
-    def __init__(self, model_name: str = DEFAULT_MODEL):
+    def __init__(self, model_name: str = DEFAULT_MODEL, model_dir: str = DEFAULT_EMBEDDING_DIR):
         self.model_name = model_name
+        self.model_dir = model_dir
         self.model = None
         self.device = "cuda" if self._cuda_available() else "cpu"
         try:
             from sentence_transformers import SentenceTransformer
 
-            self.model = SentenceTransformer(model_name, device=self.device)
-            logging.info("Loaded embedding model %s on %s", model_name, self.device)
+            # Try loading from local directory first, fallback to model name
+            if Path(model_dir).exists():
+                self.model = SentenceTransformer(model_dir, device=self.device)
+                logging.info("Loaded embedding model from local directory %s on %s", model_dir, self.device)
+            else:
+                self.model = SentenceTransformer(model_name, device=self.device)
+                logging.info("Loaded embedding model %s on %s", model_name, self.device)
         except Exception as exc:  # pragma: no cover - fallback path
             logging.warning("SentenceTransformers unavailable: %s", exc)
             self.model = None
@@ -114,6 +143,7 @@ class VectorIndex:
         self.embeddings.append(embedding)
 
     def build_from_corpus(self, corpus_dir: str, embedding_service: EmbeddingService) -> None:
+        """Build vector index from corpus directory with robust error handling."""
         self.clear()
         corpus_path = Path(corpus_dir)
         if not corpus_path.exists() or not corpus_path.is_dir():
@@ -121,18 +151,32 @@ class VectorIndex:
             return
 
         files = self._discover_files(corpus_path)
+        
+        # Handle empty directories
+        if not files:
+            logging.info("No files found in corpus directory: %s", corpus_dir)
+            return
+        
         texts_to_embed: List[Tuple[str, str, int, Dict[str, Any]]] = []
+        
         for file_path in files:
             try:
-                extracted = parse_file(file_path)
-            except Exception as exc:  # pragma: no cover - file-specific resilience
-                logging.warning("Failed to parse %s: %s", file_path, exc)
+                # Use robust read_corpus_file instead of parse_file
+                extracted_text = read_corpus_file(str(file_path))
+            except Exception as exc:
+                # Guard against any unexpected exceptions in file reading
+                logging.warning("Unexpected error processing %s: %s", file_path, exc)
                 continue
-            if not extracted:
+            
+            if not extracted_text:
+                # File was skipped or empty; continue to next
                 continue
-            for idx, chunk_text in enumerate(extracted):
+            
+            # Split extracted text into chunks
+            chunks = split_chunks(extracted_text)
+            for idx, chunk_text in enumerate(chunks):
                 relative = os.path.relpath(file_path, corpus_path)
-                texts_to_embed.append((str(relative), chunk_text, idx, {"source_file": file_path}))
+                texts_to_embed.append((str(relative), chunk_text, idx, {"source_file": str(file_path)}))
 
         if not texts_to_embed:
             logging.info("No text chunks indexed from %s", corpus_dir)
@@ -337,32 +381,29 @@ def parse_text_like(path: Path) -> List[str]:
 
 
 def parse_image(path: Path) -> List[str]:
+    """
+    Extract text from PNG/JPG/JPEG images using EasyOCR.
+    
+    Args:
+        path: Path to image file.
+    
+    Returns:
+        List of text chunks extracted from image, or empty list on failure.
+    """
+    reader = get_easyocr_reader()
+    if reader is None:
+        logging.warning("EasyOCR reader not initialized; skipping image %s", path)
+        return []
+    
     try:
-        import easyocr
-
-        reader = easyocr.Reader(["en"], gpu=False)
-        results = reader.readtext(str(path), detail=0, paragraph=True)
+        results = reader.readtext(str(path), detail=0)
         if results:
-            return split_chunks("\n".join(results))
-    except Exception:
-        pass
-
-    try:
-        from PIL import Image
-        from transformers import pipeline
-
-        pipe = pipeline("image-to-text", model="google/tapas-base-finetuned-wtq")
-        image = Image.open(path)
-        texts = pipe(image)
-        if texts:
-            values = [item.get("generated_text", "") for item in texts if isinstance(item, dict)]
-            result = "\n".join(v for v in values if v)
-            if result:
-                return split_chunks(result)
-    except Exception:
-        pass
-
-    return []
+            text = " ".join(str(r) for r in results if r)
+            return split_chunks(text)
+        return []
+    except Exception as exc:
+        logging.warning("Failed to extract text from image %s: %s", path, exc)
+        return []
 
 
 def parse_file(path: Path) -> List[str]:
@@ -385,6 +426,97 @@ def parse_file(path: Path) -> List[str]:
         logging.warning("Unhandled parse error for %s: %s", path, exc)
         return []
     return []
+
+
+def read_corpus_file(file_path: str) -> str:
+    """
+    Robust file reader with comprehensive error handling for edge cases.
+    
+    Handles:
+    - Permission denied (chmod 000)
+    - Encrypted/password-protected PDFs
+    - Empty directories and unknown file formats
+    - General corrupted files
+    
+    Args:
+        file_path: Path to file to read.
+    
+    Returns:
+        Extracted text content, or empty string on error.
+    """
+    path = Path(file_path)
+    
+    # Check if path exists and is a regular file
+    if not path.exists():
+        logging.warning("[Warning] File does not exist: %s", file_path)
+        return ""
+    
+    if not path.is_file():
+        logging.debug("Skipped non-file entry: %s", file_path)
+        return ""
+    
+    suffix = path.suffix.lower()
+    
+    # Reject unsupported file formats
+    supported_extensions = {
+        ".pdf", ".docx", ".xlsx", ".xls", ".csv",
+        ".txt", ".log", ".py",
+        ".png", ".jpg", ".jpeg"
+    }
+    if suffix not in supported_extensions:
+        logging.debug("Skipped unsupported file type: %s", file_path)
+        return ""
+    
+    # === EDGE CASE 1: Permission Denied (chmod 000) ===
+    try:
+        if not os.access(path, os.R_OK):
+            logging.warning("[Warning] Skipped unreadable file (permission denied): %s", file_path)
+            return ""
+    except OSError as exc:
+        logging.warning("[Warning] Skipped unreadable file (permission denied): %s", file_path)
+        return ""
+    
+    # === EDGE CASE 2: Encrypted/Password-Protected PDFs ===
+    if suffix == ".pdf":
+        try:
+            chunks = parse_pdf(path)
+            if chunks:
+                return " ".join(chunks)
+            else:
+                logging.warning("[Warning] Skipped encrypted PDF: %s", file_path)
+                return ""
+        except Exception as exc:
+            # Check if it's a PDF-specific error (encryption, corruption)
+            exc_str = str(exc).lower()
+            if "encrypt" in exc_str or "password" in exc_str or "pdf" in exc_str:
+                logging.warning("[Warning] Skipped encrypted PDF: %s", file_path)
+            else:
+                logging.warning("[Warning] Failed to parse PDF %s: %s", file_path, exc)
+            return ""
+    
+    # === EDGE CASE 3 & 4: Text files and other formats with general error handling ===
+    try:
+        if suffix == ".docx":
+            chunks = parse_docx(path)
+            return " ".join(chunks) if chunks else ""
+        elif suffix in {".xlsx", ".xls", ".csv"}:
+            chunks = parse_excel_or_csv(path)
+            return " ".join(chunks) if chunks else ""
+        elif suffix in {".txt", ".log", ".py"}:
+            chunks = parse_text_like(path)
+            return " ".join(chunks) if chunks else ""
+        elif suffix in {".png", ".jpg", ".jpeg"}:
+            chunks = parse_image(path)
+            return " ".join(chunks) if chunks else ""
+    except PermissionError:
+        logging.warning("[Warning] Skipped unreadable file (permission denied): %s", file_path)
+        return ""
+    except Exception as exc:
+        # General corrupted file handling
+        logging.warning("[Warning] Failed to read file %s: %s", file_path, exc)
+        return ""
+    
+    return ""
 
 
 def extract_question_keywords(question: str) -> List[str]:
@@ -483,13 +615,21 @@ def extract_answer_from_context(question: str, matches: List[DocumentChunk]) -> 
 
 
 def build_response_for_query(index: VectorIndex, question: str, embedding_service: Optional[EmbeddingService] = None) -> Dict[str, Any]:
+    """
+    Build response for query with formatted output.
+    
+    Output formatting:
+    - answer: Uppercase, stripped, special chars removed
+    - citations: Sorted list of exact relative file paths
+    - confidence: Float between 0.0 and 1.0
+    """
     matches = index.query(question, top_k=5, embedding_service=embedding_service)
     if not matches:
         return {"answer": "", "citations": [], "confidence": 0.0}
 
     top_chunks = [chunk for _, chunk in matches]
     answer = extract_answer_from_context(question, top_chunks)
-    citations = sorted({chunk.file_path for chunk in top_chunks if chunk.file_path})
+    citations = sorted(list({chunk.file_path for chunk in top_chunks if chunk.file_path}))
     if not answer:
         return {"answer": "", "citations": [], "confidence": 0.0}
     confidence = max(0.1, min(0.99, 0.35 + (matches[0][0] if matches else 0.0) * 0.65))
@@ -497,10 +637,23 @@ def build_response_for_query(index: VectorIndex, question: str, embedding_servic
 
 
 class RAGDaemon:
-    def __init__(self):
-        self.embedding_service = EmbeddingService()
+    def __init__(self, enable_gpu: bool = True):
+        """Initialize RAG daemon with embedding service and OCR reader."""
+        # Initialize embedding service with local model directory
+        self.embedding_service = EmbeddingService(
+            model_name=DEFAULT_MODEL,
+            model_dir=DEFAULT_EMBEDDING_DIR
+        )
+        
+        # Initialize EasyOCR reader from local models
+        initialize_easyocr_reader(
+            model_dir=DEFAULT_EASYOCR_DIR,
+            gpu=enable_gpu
+        )
+        
         self.index = VectorIndex()
         self.index_path: Optional[str] = None
+        logging.info("RAG daemon initialized with GPU=%s", enable_gpu)
 
     def handle_index(self, corpus_dir: str) -> Dict[str, Any]:
         start = time.time()
@@ -568,9 +721,23 @@ def main() -> int:
     parser.add_argument("--index", type=str, help="Index a corpus directory and exit.")
     parser.add_argument("--corpus", type=str, help="Corpus directory for one-off queries.")
     parser.add_argument("--query", type=str, help="Query text to answer in one-off mode.")
+    parser.add_argument("--gpu", action="store_true", help="Enable GPU acceleration for EasyOCR (default: auto-detect).")
+    parser.add_argument("--no-gpu", action="store_true", help="Disable GPU acceleration.")
     args = parser.parse_args()
 
-    daemon = RAGDaemon()
+    # Determine GPU usage
+    use_gpu = True
+    if args.no_gpu:
+        use_gpu = False
+    elif not args.gpu:
+        # Auto-detect GPU availability
+        try:
+            import torch
+            use_gpu = torch.cuda.is_available()
+        except Exception:
+            use_gpu = False
+
+    daemon = RAGDaemon(enable_gpu=use_gpu)
 
     if args.serve:
         daemon.serve()
