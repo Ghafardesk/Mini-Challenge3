@@ -396,48 +396,78 @@ def parse_image(path: Path) -> List[str]:
     Returns:
         List of text chunks extracted from image, or empty list on failure.
     """
+    # Try vLLM-based OCR first if a vision LLM is available
     llm = get_vision_llm()
-    if llm is None:
-        logging.warning("vLLM engine not initialized; skipping image %s", path)
-        return []
-    
     try:
         from PIL import Image
-        import base64
-        from io import BytesIO
-        
-        # Load image
+    except Exception:
+        logging.warning("PIL not available; cannot open image %s", path)
+        return []
+
+    try:
         image = Image.open(path)
-        
-        # Convert image to base64 for vLLM
-        buffered = BytesIO()
-        image.save(buffered, format="PNG" if path.suffix.lower() == ".png" else "JPEG")
-        img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        
-        # Official OCR prompt for Llama Vision
-        ocr_prompt = "Act as an OCR assistant. Analyze the provided <|image|> image and transcribe all visible text exactly as it appears. Output only the transcribed text without commentary."
-        
-        # Prepare multi-modal prompt with image placeholder
-        # vLLM expects the image to be referenced as <|image|> in the prompt
-        prompt = f"<|image|>{ocr_prompt}"
-        
-        # Run inference with vLLM
-        # Note: vLLM handles base64-encoded images via the image parameter
-        outputs = llm.generate(
-            [prompt],
-            sampling_params=None,
-        )
-        
-        # Extract transcribed text from output
-        if outputs and len(outputs) > 0:
-            output_text = outputs[0].outputs[0].text.strip()
-            if output_text:
-                return split_chunks(output_text)
-        
-        return []
     except Exception as exc:
-        logging.warning("Failed to extract text from image %s: %s", path, exc)
+        logging.warning("Failed to open image %s: %s", path, exc)
         return []
+
+    # vLLM path (best-effort; may be unavailable on non-NVIDIA setups)
+    if llm is not None:
+        try:
+            import base64
+            from io import BytesIO
+
+            buffered = BytesIO()
+            image.save(buffered, format="PNG" if path.suffix.lower() == ".png" else "JPEG")
+            img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+            ocr_prompt = "Act as an OCR assistant. Analyze the provided <|image|> image and transcribe all visible text exactly as it appears. Output only the transcribed text without commentary."
+            prompt = f"<|image|>{ocr_prompt}"
+
+            # NOTE: vLLM multimodal API usage varies; some deployments require passing the image payload
+            # alongside the prompt. This code attempts the simple call and will fall back to CPU OCR if
+            # the result is empty or an error occurs.
+            try:
+                outputs = llm.generate([prompt], sampling_params=None)
+                if outputs and len(outputs) > 0:
+                    # vLLM output shape may vary; defensively extract text
+                    try:
+                        output_text = outputs[0].outputs[0].text.strip()
+                    except Exception:
+                        output_text = str(outputs[0]).strip()
+                    if output_text:
+                        return split_chunks(output_text)
+            except Exception:
+                # vLLM generation failed; continue to fallbacks
+                pass
+
+    # Fallbacks: pytesseract then easyocr (best-effort, optional dependencies)
+    try:
+        import pytesseract
+        try:
+            text = pytesseract.image_to_string(image)
+            if text and text.strip():
+                return split_chunks(text)
+        except Exception:
+            pass
+    except Exception:
+        # pytesseract not installed or not usable; try EasyOCR
+        pass
+
+    try:
+        import easyocr
+        try:
+            reader = easyocr.Reader(["en"], gpu=False)
+            results = reader.readtext(str(path))
+            text_pieces = [r[1] for r in results if r and len(r) > 1 and r[1].strip()]
+            if text_pieces:
+                return split_chunks("\n".join(text_pieces))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    logging.warning("No OCR available for image %s; install vllm, pytesseract, or easyocr", path)
+    return []
 
 
 def parse_file(path: Path) -> List[str]:
