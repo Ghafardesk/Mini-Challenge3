@@ -439,7 +439,11 @@ def parse_image(path: Path) -> List[str]:
             except Exception:
                 # vLLM generation failed; continue to fallbacks
                 pass
-
+        except Exception as exc:
+            # Outer vLLM path failed (model call, I/O, or unexpected shape)
+            logging.warning("vLLM OCR path failed for image %s: %s", path, exc)
+            # continue to CPU-based fallbacks
+            pass
     # Fallbacks: pytesseract then easyocr (best-effort, optional dependencies)
     try:
         import pytesseract
