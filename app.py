@@ -12,13 +12,47 @@ from typing import Any, Dict
 SOCKET_PATH = "/tmp/rag_daemon.sock"
 TCP_HOST = "127.0.0.1"
 TCP_PORT = 8765
-DEFAULT_OUTPUT = Path("/app/output")
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_OUTPUT = PROJECT_ROOT / "output"
 
 
 def get_client_socket():
-    if hasattr(socket, "AF_UNIX"):
+    if os.name != "nt" and hasattr(socket, "AF_UNIX"):
         return socket.socket(socket.AF_UNIX, socket.SOCK_STREAM), SOCKET_PATH
     return socket.socket(socket.AF_INET, socket.SOCK_STREAM), (TCP_HOST, TCP_PORT)
+
+
+def resolve_corpus_path(corpus: str | None) -> str:
+    if not corpus:
+        return ""
+
+    raw = Path(corpus)
+    root = Path(__file__).resolve().parent
+    candidates = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.append(Path.cwd() / raw)
+        candidates.append(root / raw)
+
+        project_root = root / "mc3-starter-kit" / "mc3-starter-kit"
+        if raw.name in {"corpus", "mc3-corpus"}:
+            candidates.append(project_root / "mc3-corpus")
+            candidates.append(root / "mc3-starter-kit" / "mc3-corpus")
+        candidates.append(project_root / raw)
+        candidates.append(root / "mc3-starter-kit" / raw)
+
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists() and resolved.is_dir():
+            return str(resolved)
+
+    return str(raw)
 
 
 def _normalize_answer(value: Any) -> str:
@@ -48,18 +82,21 @@ def _normalize_response(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def ensure_daemon() -> None:
-    if hasattr(socket, "AF_UNIX") and os.path.exists(SOCKET_PATH):
+    unix_socket_mode = os.name != "nt" and hasattr(socket, "AF_UNIX")
+    if unix_socket_mode and os.path.exists(SOCKET_PATH):
         return
-    if not hasattr(socket, "AF_UNIX") and _tcp_socket_ready():
+    if not unix_socket_mode and _tcp_socket_ready():
         return
-    daemon_path = Path("/app/daemon.py")
+
+    daemon_path = PROJECT_ROOT / "daemon.py"
     if not daemon_path.exists():
         return
-    subprocess.Popen([sys.executable, str(daemon_path), "--serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    subprocess.Popen([sys.executable, str(daemon_path), "--serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(PROJECT_ROOT))
     for _ in range(100):
-        if hasattr(socket, "AF_UNIX") and os.path.exists(SOCKET_PATH):
+        if unix_socket_mode and os.path.exists(SOCKET_PATH):
             return
-        if not hasattr(socket, "AF_UNIX") and _tcp_socket_ready():
+        if not unix_socket_mode and _tcp_socket_ready():
             return
         time.sleep(0.1)
 
@@ -76,7 +113,8 @@ def _tcp_socket_ready() -> bool:
 
 def send_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     ensure_daemon()
-    if hasattr(socket, "AF_UNIX"):
+    unix_socket_mode = os.name != "nt" and hasattr(socket, "AF_UNIX")
+    if unix_socket_mode:
         if not os.path.exists(SOCKET_PATH):
             return {"answer": "", "citations": [], "confidence": 0.0}
     elif not _tcp_socket_ready():
@@ -138,14 +176,16 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.index:
-        result = send_request({"cmd": "index", "corpus": args.index})
+        resolved_corpus = resolve_corpus_path(args.index)
+        result = send_request({"cmd": "index", "corpus": resolved_corpus})
         print(json.dumps(result, ensure_ascii=False))
         return 0
 
     if args.corpus and args.query_id and args.query:
+        resolved_corpus = resolve_corpus_path(args.corpus)
         payload = {
             "cmd": "query",
-            "corpus": args.corpus,
+            "corpus": resolved_corpus,
             "query_id": args.query_id,
             "query": args.query,
         }

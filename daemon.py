@@ -69,6 +69,39 @@ def get_vision_llm() -> Optional[Any]:
     return _vision_llm
 
 
+def resolve_corpus_path(corpus_dir: str) -> str:
+    if not corpus_dir:
+        return ""
+
+    raw = Path(corpus_dir)
+    root = Path(__file__).resolve().parent
+    candidates = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        candidates.append(Path.cwd() / raw)
+        candidates.append(root / raw)
+
+        project_root = root / "mc3-starter-kit" / "mc3-starter-kit"
+        if raw.name in {"corpus", "mc3-corpus"}:
+            candidates.append(project_root / "mc3-corpus")
+            candidates.append(root / "mc3-starter-kit" / "mc3-corpus")
+        candidates.append(project_root / raw)
+        candidates.append(root / "mc3-starter-kit" / raw)
+
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if resolved.exists() and resolved.is_dir():
+            return str(resolved)
+
+    return str(raw)
+
+
 @dataclass
 class DocumentChunk:
     file_path: str
@@ -435,6 +468,7 @@ def parse_image(path: Path) -> List[str]:
                     except Exception:
                         output_text = str(outputs[0]).strip()
                     if output_text:
+                        logging.info("OCR succeeded via vLLM for image %s", path)
                         return split_chunks(output_text)
             except Exception:
                 # vLLM generation failed; continue to fallbacks
@@ -450,6 +484,7 @@ def parse_image(path: Path) -> List[str]:
         try:
             text = pytesseract.image_to_string(image)
             if text and text.strip():
+                logging.info("OCR succeeded via pytesseract for image %s", path)
                 return split_chunks(text)
         except Exception:
             pass
@@ -464,6 +499,7 @@ def parse_image(path: Path) -> List[str]:
             results = reader.readtext(str(path))
             text_pieces = [r[1] for r in results if r and len(r) > 1 and r[1].strip()]
             if text_pieces:
+                logging.info("OCR succeeded via easyocr for image %s", path)
                 return split_chunks("\n".join(text_pieces))
         except Exception:
             pass
@@ -725,21 +761,24 @@ class RAGDaemon:
         logging.info("RAG daemon initialized with vLLM vision engine")
 
     def handle_index(self, corpus_dir: str) -> Dict[str, Any]:
+        resolved_corpus = resolve_corpus_path(corpus_dir)
         start = time.time()
-        self.index.build_from_corpus(corpus_dir, self.embedding_service)
-        self.index_path = corpus_dir
+        self.index.build_from_corpus(resolved_corpus, self.embedding_service)
+        self.index_path = resolved_corpus
         elapsed = time.time() - start
-        logging.info("Index built in %.2fs for %s", elapsed, corpus_dir)
+        logging.info("Index built in %.2fs for %s", elapsed, resolved_corpus)
         return {"status": "ok", "indexed": len(self.index.chunks), "elapsed_seconds": round(elapsed, 2)}
 
     def handle_query(self, corpus_dir: str, query_text: str) -> Dict[str, Any]:
-        if not self.index.chunks or corpus_dir != self.index_path:
-            self.index.build_from_corpus(corpus_dir, self.embedding_service)
+        resolved_corpus = resolve_corpus_path(corpus_dir)
+        if not self.index.chunks or resolved_corpus != self.index_path:
+            self.index.build_from_corpus(resolved_corpus, self.embedding_service)
         response = build_response_for_query(self.index, query_text, embedding_service=self.embedding_service)
         return response
 
     def serve(self, socket_path: str = SOCKET_PATH):
-        if hasattr(socket, "AF_UNIX"):
+        use_unix_socket = os.name != "nt" and hasattr(socket, "AF_UNIX")
+        if use_unix_socket:
             try:
                 os.unlink(socket_path)
             except FileNotFoundError:
@@ -813,12 +852,12 @@ def main() -> int:
         return 0
 
     if args.index:
-        response = daemon.handle_index(args.index)
+        response = daemon.handle_index(resolve_corpus_path(args.index))
         print(json.dumps(response, ensure_ascii=False))
         return 0
 
     if args.corpus and args.query:
-        response = daemon.handle_query(args.corpus, args.query)
+        response = daemon.handle_query(resolve_corpus_path(args.corpus), args.query)
         print(json.dumps(response, ensure_ascii=False))
         return 0
 
