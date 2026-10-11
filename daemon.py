@@ -14,6 +14,7 @@ import logging
 import math
 import os
 import re
+import stat
 import socket
 import sys
 import time
@@ -263,22 +264,16 @@ def cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
 def normalize_answer(value: Any) -> str:
     if value is None:
         return ""
-    answer = str(value).strip().upper()
-    for ch in "-._·":
-        answer = answer.replace(ch, "")
-    return answer.strip()
+    return re.sub(r"[-.·_\s]", "", str(value).upper().strip())
 
 
 def safe_read_utf8(path: Path) -> str:
     try:
-        with path.open("r", encoding="utf-8", errors="strict") as fh:
+        with path.open("r", encoding="utf-8", errors="ignore") as fh:
             return fh.read()
-    except Exception:
-        try:
-            with path.open("r", encoding="utf-8", errors="replace") as fh:
-                return fh.read()
-        except Exception:
-            return ""
+    except (OSError, UnicodeError) as exc:
+        logging.warning("Failed to read text file %s: %s", path, exc)
+        return ""
 
 
 def split_chunks(text: str, chunk_size: int = 900) -> List[str]:
@@ -312,6 +307,9 @@ def parse_pdf(path: Path) -> List[str]:
         import pypdf
 
         reader = pypdf.PdfReader(str(path))
+        if reader.is_encrypted:
+            logging.warning("Skipped encrypted PDF: %s", path)
+            return []
         for page in reader.pages:
             try:
                 page_text = page.extract_text() or ""
@@ -396,10 +394,12 @@ def parse_excel_or_csv(path: Path) -> List[str]:
         if suffix in {".xlsx", ".xls"}:
             import pandas as pd
 
-            frame = pd.read_excel(path, engine="openpyxl")
             rows = []
-            for _, row in frame.fillna("").iterrows():
-                rows.append(" | ".join(str(cell).strip() for cell in row.tolist() if str(cell).strip()))
+            sheets = pd.read_excel(path, engine="openpyxl", sheet_name=None)
+            for sheet_name, frame in sheets.items():
+                rows.append(str(sheet_name))
+                for _, row in frame.fillna("").iterrows():
+                    rows.append(" | ".join(str(cell).strip() for cell in row.tolist() if str(cell).strip()))
             return split_chunks("\n".join(rows))
         return []
     except Exception as exc:
@@ -460,7 +460,10 @@ def parse_image(path: Path) -> List[str]:
             # alongside the prompt. This code attempts the simple call and will fall back to CPU OCR if
             # the result is empty or an error occurs.
             try:
-                outputs = llm.generate([prompt], sampling_params=None)
+                outputs = llm.generate(
+                    [{"prompt": prompt, "multi_modal_data": {"image": image}}],
+                    sampling_params=None,
+                )
                 if outputs and len(outputs) > 0:
                     # vLLM output shape may vary; defensively extract text
                     try:
@@ -571,9 +574,8 @@ def read_corpus_file(file_path: str) -> str:
         logging.debug("Skipped unsupported file type: %s", file_path)
         return ""
     
-    # === EDGE CASE 1: Permission Denied (chmod 000) ===
     try:
-        if not os.access(path, os.R_OK):
+        if not os.access(path, os.R_OK) or not (path.stat().st_mode & (stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)):
             logging.warning("[Warning] Skipped unreadable file (permission denied): %s", file_path)
             return ""
     except OSError as exc:
@@ -677,20 +679,26 @@ def extract_value_candidates(line: str) -> List[str]:
 
 
 def extract_answer_from_context(question: str, matches: List[DocumentChunk]) -> str:
+    answer, _ = _extract_answer_with_source(question, matches)
+    return answer
+
+
+def _extract_answer_with_source(question: str, matches: List[DocumentChunk]) -> Tuple[str, Optional[DocumentChunk]]:
     if not matches:
-        return ""
+        return "", None
     keywords = set(extract_question_keywords(question))
     best_line = ""
     best_score = -1
     best_candidates: List[str] = []
+    best_chunk: Optional[DocumentChunk] = None
 
     for match in matches:
         for line in candidate_lines_from_chunk(match.text):
             line_lower = line.lower()
-            score = 0
-            for keyword in keywords:
-                if keyword in line_lower:
-                    score += 10
+            matching_keywords = sum(1 for keyword in keywords if keyword in line_lower)
+            if not matching_keywords:
+                continue
+            score = matching_keywords * 10
             if any(ch.isdigit() for ch in line):
                 score += 4
             if re.search(r"\b[A-Z]{2,}[A-Z0-9_-]{2,}\b", line):
@@ -702,20 +710,18 @@ def extract_answer_from_context(question: str, matches: List[DocumentChunk]) -> 
                 best_score = score
                 best_line = line
                 best_candidates = values
+                best_chunk = match
 
     if not best_line:
-        first_line = candidate_lines_from_chunk(matches[0].text)[0] if candidate_lines_from_chunk(matches[0].text) else ""
-        if first_line:
-            best_line = first_line
-            best_candidates = extract_value_candidates(first_line)
+        return "", None
 
     if best_candidates:
-        return normalize_answer(best_candidates[0])
+        return normalize_answer(best_candidates[0]), best_chunk
 
     value_match = re.search(r"(?<![A-Z0-9])(?:\d+(?:\.\d+)?(?:\s*(?:%|MS|MB|GB|W|V|A|HZ|KHZ|MHZ|GHZ|C|MA|MV|DB|RPM|NM|S|H|D|N|KG|MM|IN|LB|KW|TB|KB|B))?|[A-Z]{2,}[A-Z0-9_-]{2,})", best_line, flags=re.IGNORECASE)
     if value_match:
-        return normalize_answer(value_match.group(0))
-    return ""
+        return normalize_answer(value_match.group(0)), best_chunk
+    return "", None
 
 
 def build_response_for_query(index: VectorIndex, question: str, embedding_service: Optional[EmbeddingService] = None) -> Dict[str, Any]:
@@ -732,10 +738,10 @@ def build_response_for_query(index: VectorIndex, question: str, embedding_servic
         return {"answer": "", "citations": [], "confidence": 0.0}
 
     top_chunks = [chunk for _, chunk in matches]
-    answer = extract_answer_from_context(question, top_chunks)
-    citations = sorted(list({chunk.file_path for chunk in top_chunks if chunk.file_path}))
-    if not answer:
+    answer, supporting_chunk = _extract_answer_with_source(question, top_chunks)
+    if not answer or supporting_chunk is None or not supporting_chunk.file_path:
         return {"answer": "", "citations": [], "confidence": 0.0}
+    citations = [supporting_chunk.file_path]
     confidence = max(0.1, min(0.99, 0.35 + (matches[0][0] if matches else 0.0) * 0.65))
     return {"answer": answer, "citations": citations, "confidence": round(confidence, 4)}
 

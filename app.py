@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -58,10 +59,7 @@ def resolve_corpus_path(corpus: str | None) -> str:
 def _normalize_answer(value: Any) -> str:
     if value is None:
         return ""
-    answer = str(value).strip().upper()
-    for ch in "-._·":
-        answer = answer.replace(ch, "")
-    return answer.strip()
+    return re.sub(r"[-.·_\s]", "", str(value).upper().strip())
 
 
 def _normalize_response(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -69,7 +67,10 @@ def _normalize_response(payload: Dict[str, Any]) -> Dict[str, Any]:
     citations = payload.get("citations", []) or []
     if not isinstance(citations, list):
         citations = [str(citations)]
-    confidence = float(payload.get("confidence", 0.0) or 0.0)
+    try:
+        confidence = float(payload.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
     if confidence < 0:
         confidence = 0.0
     if confidence > 1:
