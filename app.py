@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import logging
 import os
 import re
 import socket
@@ -84,22 +85,38 @@ def _normalize_response(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def ensure_daemon() -> None:
     unix_socket_mode = os.name != "nt" and hasattr(socket, "AF_UNIX")
-    if unix_socket_mode and os.path.exists(SOCKET_PATH):
+    if unix_socket_mode and _unix_socket_ready():
         return
     if not unix_socket_mode and _tcp_socket_ready():
         return
 
     daemon_path = PROJECT_ROOT / "daemon.py"
     if not daemon_path.exists():
+        logging.error("RAG daemon script is missing: %s", daemon_path)
         return
 
-    subprocess.Popen([sys.executable, str(daemon_path), "--serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(PROJECT_ROOT))
-    for _ in range(100):
-        if unix_socket_mode and os.path.exists(SOCKET_PATH):
+    subprocess.Popen(
+        [sys.executable, str(daemon_path), "--serve"],
+        stdout=subprocess.DEVNULL,
+        cwd=str(PROJECT_ROOT),
+    )
+    for _ in range(6000):
+        if unix_socket_mode and _unix_socket_ready():
             return
         if not unix_socket_mode and _tcp_socket_ready():
             return
         time.sleep(0.1)
+    logging.error("RAG daemon did not become ready within 10 minutes")
+
+
+def _unix_socket_ready() -> bool:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.2)
+            sock.connect(SOCKET_PATH)
+            return True
+    except OSError:
+        return False
 
 
 def _tcp_socket_ready() -> bool:
@@ -108,7 +125,7 @@ def _tcp_socket_ready() -> bool:
             sock.settimeout(0.2)
             sock.connect((TCP_HOST, TCP_PORT))
             return True
-    except Exception:
+    except OSError:
         return False
 
 
@@ -116,15 +133,17 @@ def send_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     ensure_daemon()
     unix_socket_mode = os.name != "nt" and hasattr(socket, "AF_UNIX")
     if unix_socket_mode:
-        if not os.path.exists(SOCKET_PATH):
+        if not _unix_socket_ready():
+            logging.error("RAG daemon Unix socket is unavailable")
             return {"answer": "", "citations": [], "confidence": 0.0}
     elif not _tcp_socket_ready():
+        logging.error("RAG daemon TCP endpoint is unavailable")
         return {"answer": "", "citations": [], "confidence": 0.0}
 
     response_data = b""
     sock, address = get_client_socket()
     with sock:
-        sock.settimeout(30)
+        sock.settimeout(600 if payload.get("cmd") == "index" else 30)
         try:
             sock.connect(address)
             sock.sendall(json.dumps(payload).encode("utf-8"))
@@ -140,15 +159,21 @@ def send_request(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if not chunk:
                     break
                 response_data += chunk
-        except Exception:
+        except OSError as exc:
+            logging.error("RAG daemon request failed: %s", exc)
             return {"answer": "", "citations": [], "confidence": 0.0}
 
     if not response_data:
+        logging.error("RAG daemon returned an empty response")
         return {"answer": "", "citations": [], "confidence": 0.0}
     try:
         decoded = response_data.decode("utf-8")
         data = json.loads(decoded)
-    except Exception:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logging.error("RAG daemon returned invalid JSON: %s", exc)
+        return {"answer": "", "citations": [], "confidence": 0.0}
+    if not isinstance(data, dict):
+        logging.error("RAG daemon response was not a JSON object")
         return {"answer": "", "citations": [], "confidence": 0.0}
     if payload.get("cmd") == "index":
         return data
