@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 FROM rocm/pytorch:rocm10.0_ubuntu26.04_py3.14_pytorch_release_2.13.0
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -20,10 +22,12 @@ assert '+rocm' in torch.__version__, f"Unexpected torch build: {torch.__version_
 PY
 
 RUN python3 -m pip install --no-deps --no-cache-dir -r /app/requirements.txt
-RUN python3 /app/download_model.py
+RUN --mount=type=secret,id=hf_token,required=false \
+    if [ -f /run/secrets/hf_token ]; then \
+        export HF_TOKEN="$(cat /run/secrets/hf_token)"; \
+    fi && \
+    python3 /app/download_model.py
 
 RUN mkdir -p /app/output /models /app/corpus
 
-EXPOSE 8080
-
-CMD ["bash", "-lc", "python3 /app/daemon.py --serve & sleep 3; tail -f /dev/null"]
+CMD ["sleep", "infinity"]
