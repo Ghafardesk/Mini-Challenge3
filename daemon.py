@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 SOCKET_PATH = "/tmp/rag_daemon.sock"
 TCP_HOST = "127.0.0.1"
 TCP_PORT = 8765
@@ -62,9 +64,12 @@ def initialize_vision_llm(model_dir: str = DEFAULT_VISION_DIR) -> Optional[Any]:
 
         _vision_llm = LLM(
             model=model_dir,
+            device="cuda",
+            tensor_parallel_size=1,
             max_model_len=4096,
             max_num_seqs=16,
             enforce_eager=True,
+            trust_remote_code=True,
         )
         _vision_tokenizer = AutoTokenizer.from_pretrained(model_dir)
         logging.info("Initialized vLLM vision engine from %s", model_dir)
@@ -115,6 +120,20 @@ def resolve_corpus_path(corpus_dir: str) -> str:
             return str(resolved)
 
     return str(raw)
+
+
+def get_clean_relative_path(file_path: str | Path, base_corpus_dir: str | Path) -> str:
+    """Return a normalized, corpus-relative path using forward slashes."""
+    base_path = Path(base_corpus_dir).expanduser().resolve()
+    candidate = Path(file_path).expanduser()
+    absolute_file = (candidate if candidate.is_absolute() else base_path / candidate).resolve()
+    relative_path = absolute_file.relative_to(base_path)
+
+    parts: List[str] = []
+    for part in relative_path.parts:
+        if not parts or part != parts[-1]:
+            parts.append(part)
+    return Path(*parts).as_posix()
 
 
 @dataclass
@@ -228,8 +247,8 @@ class VectorIndex:
             # Split extracted text into chunks
             chunks = split_chunks(extracted_text)
             for idx, chunk_text in enumerate(chunks):
-                relative = os.path.relpath(file_path, corpus_path)
-                texts_to_embed.append((str(relative), chunk_text, idx, {"source_file": str(file_path)}))
+                relative = get_clean_relative_path(file_path, corpus_path)
+                texts_to_embed.append((relative, chunk_text, idx, {"source_file": str(file_path)}))
 
         if not texts_to_embed:
             logging.info("No text chunks indexed from %s", corpus_dir)
@@ -278,7 +297,7 @@ def cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
 
 
 def normalize_answer(value: Any) -> str:
-    if value is None:
+    if not value:
         return ""
     return re.sub(r"[-.·_\s]", "", str(value).upper().strip())
 
@@ -333,8 +352,18 @@ def parse_pdf(path: Path) -> List[str]:
                     texts.append(page_text)
             except Exception:
                 continue
-    except Exception:
-        pass
+    except PermissionError:
+        raise
+    except Exception as exc:
+        error_type = type(exc).__name__
+        error_message = str(exc).lower()
+        if error_type in {"PdfReadError", "FileNotDecryptedError", "WrongPasswordError"} or any(
+            marker in error_message
+            for marker in ("encrypted", "decrypt", "aes algorithm", "password")
+        ):
+            logging.warning("Skipped unreadable or encrypted PDF %s: %s", path, exc)
+            return []
+        logging.warning("pypdf could not read %s; trying fallback parser: %s", path, exc)
     if texts:
         return split_chunks("\n\n".join(texts))
 
@@ -350,8 +379,10 @@ def parse_pdf(path: Path) -> List[str]:
             except Exception:
                 continue
         doc.close()
-    except Exception:
-        pass
+    except PermissionError:
+        raise
+    except Exception as exc:
+        logging.warning("PyMuPDF could not read %s; trying fallback parser: %s", path, exc)
     if texts:
         return split_chunks("\n\n".join(texts))
 
@@ -366,8 +397,10 @@ def parse_pdf(path: Path) -> List[str]:
                         texts.append(page_text)
                 except Exception:
                     continue
-    except Exception:
-        pass
+    except PermissionError:
+        raise
+    except Exception as exc:
+        logging.warning("pdfplumber could not read %s: %s", path, exc)
     if texts:
         return split_chunks("\n\n".join(texts))
 
@@ -699,6 +732,7 @@ def _line_relevance(question: str, line: str) -> int:
 
 def _answer_candidate_for_line(question: str, line: str) -> str:
     preferred_patterns = _preferred_field_patterns(question)
+    asks_for_signal_description = "signal" in question.lower() and "description" in question.lower()
     if preferred_patterns:
         fields = re.findall(r"(?:^|\|)\s*([^:|=]+?)\s*:\s*([^|]+)", line)
         for pattern in preferred_patterns:
@@ -709,10 +743,11 @@ def _answer_candidate_for_line(question: str, line: str) -> str:
                     if is_likely_value(selected):
                         return _clean_answer_candidate(selected)
 
-        if "signal" in question.lower() and "description" in question.lower():
+        if asks_for_signal_description:
             signal = re.search(r"\b([A-Z][A-Z0-9_]*#)(?=$|\s|[|,;])", line)
             if signal:
                 return normalize_answer(signal.group(1))
+            return ""
         if "pin" in question.lower():
             pin = re.search(r"\b([A-Z]\d{1,3})\b", line)
             if pin:
@@ -752,6 +787,72 @@ def _answer_candidate_for_line(question: str, line: str) -> str:
     return ""
 
 
+def _answer_candidate_for_image(question: str, chunk: DocumentChunk) -> str:
+    """Resolve pin-to-signal lookups from OCR text while preserving row association."""
+    if Path(chunk.file_path).suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+        return ""
+
+    text = chunk.text
+    normalized_question = question.lower()
+    if "signal" in normalized_question and "description" in normalized_question:
+        requested_pin = re.search(r"\bpin\s+(\d+)\b", normalized_question)
+        if requested_pin:
+            pin_labels = list(re.finditer(r"\b([A-Z]\d{1,3})\b", text))
+            ordinal = int(requested_pin.group(1))
+            if 1 <= ordinal <= len(pin_labels):
+                target_pin = pin_labels[ordinal - 1]
+                next_pin = next(
+                    (match for match in pin_labels if match.start() > target_pin.start()),
+                    None,
+                )
+                associated_text = text[target_pin.end():next_pin.start() if next_pin else len(text)]
+                signal = re.search(r"\b([A-Z][A-Z0-9_]*#)(?=$|\W)", associated_text)
+                if signal:
+                    return normalize_answer(signal.group(1))
+
+    target_signal = re.search(r"\b([A-Z][A-Z0-9_]*#)(?=$|\W)", question)
+    if target_signal and "pin" in normalized_question:
+        signal_match = re.search(
+            rf"\b{re.escape(target_signal.group(1))}(?=$|\W)",
+            text,
+            re.IGNORECASE,
+        )
+        if signal_match:
+            pin_labels = list(re.finditer(r"\b([A-Z]\d{1,3})\b", text))
+            if pin_labels:
+                signal_line_number = text.count("\n", 0, signal_match.start())
+                same_line_pins = [
+                    pin for pin in pin_labels
+                    if pin.start() < signal_match.start()
+                    and text.count("\n", 0, pin.start()) == signal_line_number
+                ]
+                if same_line_pins:
+                    return normalize_answer(same_line_pins[-1].group(1))
+
+                signal_line = next(
+                    (line for line in text.splitlines() if target_signal.group(1).lower() in line.lower()),
+                    "",
+                )
+                signal_tokens = [
+                    token
+                    for token in re.findall(r"\b[A-Z][A-Z0-9_]*(?:#)?(?=$|\W)", signal_line)
+                    if not re.fullmatch(r"[A-Z]\d{1,3}", token)
+                ]
+                if len(signal_tokens) > 1:
+                    signal_ordinal = next(
+                        (
+                            ordinal
+                            for ordinal, token in enumerate(signal_tokens)
+                            if token.lower() == target_signal.group(1).lower()
+                        ),
+                        -1,
+                    )
+                    if 0 <= signal_ordinal < len(pin_labels):
+                        return normalize_answer(pin_labels[signal_ordinal].group(1))
+
+    return ""
+
+
 def extract_answer_from_context(question: str, matches: List[DocumentChunk]) -> str:
     answer, _ = _extract_answer_with_source(question, matches)
     return answer
@@ -760,6 +861,12 @@ def extract_answer_from_context(question: str, matches: List[DocumentChunk]) -> 
 def _extract_answer_with_source(question: str, matches: List[DocumentChunk]) -> Tuple[str, Optional[DocumentChunk]]:
     if not matches:
         return "", None
+
+    for match in matches:
+        image_answer = _answer_candidate_for_image(question, match)
+        if image_answer:
+            return image_answer, match
+
     best_answer = ""
     best_score = 0
     best_chunk: Optional[DocumentChunk] = None
@@ -790,6 +897,20 @@ def build_response_for_query(index: VectorIndex, question: str, embedding_servic
     matches = index.query(question, top_k=len(index.chunks), embedding_service=embedding_service)
     if not matches:
         return {"answer": "", "citations": [], "confidence": 0.0}
+
+    question_lower = question.lower()
+    if any(term in question_lower for term in ("backplane", "pinout", "asset label")):
+        image_matches = [
+            match for match in matches
+            if Path(match[1].file_path).suffix.lower() in {".png", ".jpg", ".jpeg"}
+        ]
+        if "asset label" in question_lower:
+            targeted_matches = [match for match in image_matches if "label" in match[1].file_path.lower()]
+        else:
+            targeted_matches = [match for match in image_matches if "pinout" in match[1].file_path.lower()]
+        if not targeted_matches and not image_matches:
+            return {"answer": "", "citations": [], "confidence": 0.0}
+        matches = (targeted_matches or image_matches)[:1]
 
     ranked_chunks = sorted(
         (chunk for _, chunk in matches),
