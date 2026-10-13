@@ -28,7 +28,6 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{secrets.DOCKERHUB_USERNAME}}/arsa-rag:v1
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/mini-challenge3:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/mini-challenge3:${{ github.sha }}
+            ${{secrets.DOCKERHUB_USERNAME}}/arsa-rag:v1
+            ${{ secrets.DOCKERHUB_USERNAME }}/arsa-rag:${{ github.sha }}
