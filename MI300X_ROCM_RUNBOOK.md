@@ -149,6 +149,12 @@ container flags/runtime. A hosted notebook that does not grant Docker/device
 access can still run the local Python checks, but cannot validate the final
 challenge image there.
 
+For the GitHub Actions Docker build, add a repository Actions secret named
+`HF_TOKEN` under **Settings → Secrets and variables → Actions**. Its Hugging
+Face account must have accepted the terms and been approved for
+`meta-llama/Llama-3.2-11B-Vision-Instruct`. The workflow passes this secret to
+BuildKit without adding it to the image.
+
 Before scoring, verify the image is based on the mandated `FROM` line, its
 uncompressed size is at most **60 GiB**, and model weights are present in the
 image. The evaluator has no network access; never rely on a model download at

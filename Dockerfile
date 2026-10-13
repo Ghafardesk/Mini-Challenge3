@@ -22,10 +22,12 @@ assert '+rocm' in torch.__version__, f"Unexpected torch build: {torch.__version_
 PY
 
 RUN python3 -m pip install --no-deps --no-cache-dir -r /app/requirements.txt
-RUN --mount=type=secret,id=hf_token,required=false \
-    if [ -f /run/secrets/hf_token ]; then \
-        export HF_TOKEN="$(cat /run/secrets/hf_token)"; \
+RUN --mount=type=secret,id=hf_token,required=true \
+    if [ ! -s /run/secrets/hf_token ]; then \
+        echo "HF_TOKEN build secret is missing or empty; provide an approved Hugging Face token." >&2; \
+        exit 1; \
     fi && \
+    export HF_TOKEN="$(cat /run/secrets/hf_token)" && \
     python3 /app/download_model.py
 
 RUN mkdir -p /app/output /models /app/corpus

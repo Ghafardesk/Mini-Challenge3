@@ -24,10 +24,14 @@ jobs:
 
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v7
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         with:
           context: .
           file: ./Dockerfile
           push: true
+          secret-envs: |
+            hf_token=HF_TOKEN
           tags: |
             ${{secrets.DOCKERHUB_USERNAME}}/arsa-rag:v1
             ${{ secrets.DOCKERHUB_USERNAME }}/arsa-rag:${{ github.sha }}
