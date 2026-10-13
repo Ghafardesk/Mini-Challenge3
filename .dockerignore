@@ -3,7 +3,12 @@ mc3-starter-kit/
 .venv/
 venv/
 models/
+corpus/
 output/
+.pytest_cache/
 __pycache__/
 *.py[cod]
-.pytest_cache/
+*.pyc
+*.PNG
+*.pdf
+ocr_vllm_official.txt
